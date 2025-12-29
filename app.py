@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import logging
 import random
@@ -1104,16 +1105,13 @@ class TicToeBot:
         return app
 
 
-async def main() -> None:
+def main() -> None:
     settings = load_settings()
     bot = TicToeBot(settings)
     app = bot.build_app()
     logger.info("Starting polling bot")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    await app.updater.idle()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
