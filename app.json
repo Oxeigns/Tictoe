@@ -1,18 +1,39 @@
 {
   "name": "Premium TicToe Bot",
   "description": "Async Telegram TicTacToe bot with MongoDB persistence.",
+  "repository": "https://github.com/Oxeigns/Tictoe",
+  "keywords": ["telegram", "bot", "tictactoe", "python", "mongodb"],
   "env": {
-    "BOT_TOKEN": {"description": "Telegram bot token", "required": true},
-    "MONGO_URL": {"description": "MongoDB connection string", "required": true},
-    "OWNER_ID": {"description": "Numeric Telegram user id of the owner", "required": true},
-    "API_ID": {"description": "Telegram api_id", "required": true},
-    "API_HASH": {"description": "Telegram api_hash", "required": true},
-    "JOIN_TIMEOUT_SEC": {"description": "Invite expiry seconds", "required": false},
-    "TURN_TIMEOUT_SEC": {"description": "Turn timeout seconds", "required": false},
-    "CALLBACK_THROTTLE_SEC": {"description": "Callback throttle seconds", "required": false}
+    "BOT_TOKEN": { "description": "Telegram bot token", "required": true },
+    "MONGO_URL": { "description": "MongoDB connection string", "required": true },
+    "OWNER_ID": { "description": "Numeric Telegram user id of the owner", "required": true },
+    "API_ID": { "description": "Telegram api_id", "required": true },
+    "API_HASH": { "description": "Telegram api_hash", "required": true },
+
+    "JOIN_TIMEOUT_SEC": {
+      "description": "Invite expiry seconds",
+      "required": false,
+      "value": "60"
+    },
+    "TURN_TIMEOUT_SEC": {
+      "description": "Turn timeout seconds",
+      "required": false,
+      "value": "45"
+    },
+    "CALLBACK_THROTTLE_SEC": {
+      "description": "Callback throttle seconds",
+      "required": false,
+      "value": "1.2"
+    }
   },
-  "formation": {"worker": {"quantity": 1, "size": "free"}},
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
   "addons": [],
-  "buildpacks": [],
-  "repository": ""
+  "buildpacks": [
+    { "url": "heroku/python" }
+  ]
 }
