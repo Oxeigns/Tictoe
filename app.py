@@ -668,6 +668,10 @@ class TicToeBot:
                 await q.answer("Not your invite", show_alert=True)
                 return
 
+        if q.from_user.id in game.get("players", []):
+            await q.answer("You are already in this lobby.", show_alert=True)
+            return
+
         players = game.get("players", [])
         if len(players) >= 2:
             await q.answer("Lobby full", show_alert=True)
