@@ -488,11 +488,12 @@ class TicToeBot:
         if len(players) < 2:
             return
 
+        host_id = game.get("hostId") or players[0]
         text = build_card(
             "🎭 Choose your sign",
             [
                 f"Players: <code>{players[0]}</code> vs <code>{players[1]}</code>",
-                "First valid choice locks the mapping.",
+                f"Host (<code>{host_id}</code>) picks ❌ or 0️⃣; the challenger gets the other.",
             ],
             "Tap ❌ or 0️⃣ (or 🎲 Random)",
         )
@@ -731,6 +732,11 @@ class TicToeBot:
         players = game.get("players", [])
         if q.from_user.id not in players:
             await q.answer("Only players can pick.", show_alert=True)
+            return
+
+        host_id = game.get("hostId") or (players[0] if players else None)
+        if host_id and q.from_user.id != host_id:
+            await q.answer("Only the host can choose the sign.", show_alert=True)
             return
 
         if game.get("playerX") or game.get("playerO"):
