@@ -357,19 +357,40 @@ class TicToeBot:
         self.mongo.update_game(game_id, {"$set": {"messageRefs.lobbyMsgId": sent.message_id}})
         await self.log_event(chat.id, game_id, "lobby_created", {"host": user.id}, context)
 
-    async def join(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        chat = update.effective_chat
-        user = update.effective_user
-        if not msg or not chat or not user:
+    async def _join_flow(
+        self,
+        chat,
+        user,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        args: Optional[List[str]] = None,
+        message=None,
+        reply_to_message=None,
+    ) -> None:
+        """Shared join flow for /join command and Join Game button."""
+
+        if not chat or not user:
             return
+
+        async def _send_text(text: str) -> None:
+            if message:
+                await message.reply_text(text)
+            else:
+                await context.bot.send_message(chat.id, text)
+
+        async def _send_html(text: str, *, markup=None) -> None:
+            if message:
+                await message.reply_html(text, reply_markup=markup)
+            else:
+                await context.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
         if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            await msg.reply_text("Join works inside a group lobby.")
+            await _send_text("Join works inside a group lobby.")
             return
 
         game = self.current_game(chat.id)
         if not game or game.get("status") not in {"LOBBY", "SIGN_PICK"}:
-            await msg.reply_text("No active lobby. Use /startgame first.")
+            await _send_text("No active lobby. Use /startgame first.")
             return
 
         self.mongo.upsert_user({"_id": user.id, "name": user.full_name, "username": user.username})
@@ -380,17 +401,17 @@ class TicToeBot:
         target_user_id: Optional[int] = None
         target_username: Optional[str] = None
 
-        if msg.reply_to_message and msg.reply_to_message.from_user:
-            target_user_id = msg.reply_to_message.from_user.id
+        if reply_to_message and reply_to_message.from_user:
+            target_user_id = reply_to_message.from_user.id
 
-        if context.args and context.args[0].startswith("@"):
-            target_username = context.args[0].lstrip("@").strip() or None
+        if args and args[0].startswith("@"):
+            target_username = args[0].lstrip("@").strip() or None
 
         if (target_user_id or target_username) and (game.get("status") == "LOBBY"):
             join_until = utcnow() + dt.timedelta(seconds=self.settings.join_timeout_sec)
 
             if target_user_id and target_user_id == user.id:
-                await msg.reply_text("You can't invite yourself.")
+                await _send_text("You can't invite yourself.")
                 return
 
             self.mongo.update_game(
@@ -420,18 +441,18 @@ class TicToeBot:
                 ],
                 "Only the invited user can accept.",
             )
-            await msg.reply_html(text, reply_markup=self.invite_keyboard(game["_id"]))
+            await _send_html(text, markup=self.invite_keyboard(game["_id"]))
             await self.log_event(chat.id, game["_id"], "invite_sent", {"to": target_user_id, "toUsername": target_username, "by": user.id}, context)
             return
 
         # Normal join (open lobby)
         if user.id in game.get("players", []):
-            await msg.reply_text("You are already in the lobby.")
+            await _send_text("You are already in the lobby.")
             return
 
         players = game.get("players", [])
         if len(players) >= 2:
-            await msg.reply_text("Lobby already has two players.")
+            await _send_text("Lobby already has two players.")
             return
 
         players.append(user.id)
@@ -442,6 +463,22 @@ class TicToeBot:
 
         # Edit lobby message instead of sending new noise
         await self.render_lobby_or_sign(updated, context)
+
+    async def join(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not chat or not user:
+            return
+
+        await self._join_flow(
+            chat,
+            user,
+            context,
+            args=context.args,
+            message=msg,
+            reply_to_message=msg.reply_to_message,
+        )
 
     async def render_lobby_or_sign(self, game: Dict, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = game["groupId"]
@@ -1074,9 +1111,19 @@ class TicToeBot:
         q = update.callback_query
         if not q or not q.message:
             return
-        # Reuse join() logic by building a synthetic Update with message
-        fake_update = Update(update.update_id, message=q.message)
-        await self.join(fake_update, context)
+        if self._throttle(q.from_user.id):
+            await q.answer()
+            return
+        await q.answer()
+
+        await self._join_flow(
+            q.message.chat,
+            q.from_user,
+            context,
+            args=None,
+            message=q.message,
+            reply_to_message=None,
+        )
 
     # --------------------- Build app ---------------------
 
