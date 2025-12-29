@@ -1,16 +1,25 @@
-"""Telegram TicTacToe bot using python-telegram-bot v20."""
+# app.py
+"""Telegram TicTacToe bot using python-telegram-bot v20 (fixed + upgraded)."""
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
 import logging
+import random
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from cachetools import TTLCache
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import AIORateLimiter, Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.error import RetryAfter, TimedOut
+from telegram.ext import (
+    AIORateLimiter,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 from config import is_owner, load_settings
 from mongodb import Mongo
@@ -19,7 +28,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 
-# --- Helpers ---------------------------------------------------------------
+# ------------------------- Helpers -----------------------------------------
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.utcnow()
+
 
 def build_card(title: str, body: List[str], footer: Optional[str] = None) -> str:
     lines = [f"<b>{title}</b>", "──────────────────"]
@@ -30,29 +43,8 @@ def build_card(title: str, body: List[str], footer: Optional[str] = None) -> str
     return "\n".join(lines)
 
 
-def board_markup(board: List[str], game_id: str, highlight: Optional[List[int]] = None) -> Tuple[str, InlineKeyboardMarkup]:
-    highlight = highlight or []
-    buttons: List[List[InlineKeyboardButton]] = []
-    rows = []
-    for r in range(3):
-        row_btns = []
-        row_symbols = []
-        for c in range(3):
-            idx = r * 3 + c
-            cell = board[idx]
-            symbol = "⬜️" if not cell else ("❌" if cell == "X" else "0️⃣")
-            if idx in highlight and cell:
-                symbol = f"✨{symbol}"
-            row_symbols.append(symbol)
-            row_btns.append(InlineKeyboardButton(symbol, callback_data=f"ttt:cell:{idx}:{game_id}"))
-        rows.append("".join(row_symbols))
-        buttons.append(row_btns)
-    text = "\n".join(rows)
-    return text, InlineKeyboardMarkup(buttons)
-
-
-def check_winner(board: List[str]) -> Tuple[Optional[str], Optional[List[int]]]:
-    lines = [
+def winner_lines() -> List[Tuple[int, int, int]]:
+    return [
         (0, 1, 2),
         (3, 4, 5),
         (6, 7, 8),
@@ -62,7 +54,10 @@ def check_winner(board: List[str]) -> Tuple[Optional[str], Optional[List[int]]]:
         (0, 4, 8),
         (2, 4, 6),
     ]
-    for a, b, c in lines:
+
+
+def check_winner(board: List[str]) -> Tuple[Optional[str], Optional[List[int]]]:
+    for a, b, c in winner_lines():
         if board[a] and board[a] == board[b] == board[c]:
             return board[a], [a, b, c]
     if all(board):
@@ -70,21 +65,35 @@ def check_winner(board: List[str]) -> Tuple[Optional[str], Optional[List[int]]]:
     return None, None
 
 
-# --- Bot class ------------------------------------------------------------
+def mention_html(user_id: int, name: str) -> str:
+    # Avoid importing helpers; keep it simple
+    return f'<a href="tg://user?id={user_id}">{name}</a>'
 
+
+# ------------------------- Bot ---------------------------------------------
 
 class TicToeBot:
     def __init__(self, settings) -> None:
         self.settings = settings
         self.mongo = Mongo(settings)
-        self.throttle_cache: TTLCache[int, float] = TTLCache(maxsize=1000, ttl=settings.callback_throttle_sec)
 
-    # Utility
+        # Callback spam throttle (per-user)
+        self.throttle_cache: TTLCache[int, float] = TTLCache(
+            maxsize=2000, ttl=settings.callback_throttle_sec
+        )
+
+        # Background expiry task
+        self._expiry_task: Optional[asyncio.Task] = None
+
+    # --------------------- Throttle ---------------------
+
     def _throttle(self, user_id: int) -> bool:
         if user_id in self.throttle_cache:
             return True
-        self.throttle_cache[user_id] = dt.datetime.utcnow().timestamp()
+        self.throttle_cache[user_id] = utcnow().timestamp()
         return False
+
+    # --------------------- DB helpers ---------------------
 
     def current_game(self, group_id: int) -> Optional[Dict]:
         group = self.mongo.groups.find_one({"_id": group_id})
@@ -95,29 +104,87 @@ class TicToeBot:
             return None
         return self.mongo.fetch_game(game_id)
 
-    # UI helpers
+    # --------------------- UI builders ---------------------
+
     def lobby_keyboard(self, game_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("✅ Join Game", callback_data=f"ttt:join:{game_id}")],
-                [InlineKeyboardButton("🏳️ Flee", callback_data=f"ttt:flee:{game_id}")],
+                [InlineKeyboardButton("❌ Cancel Lobby", callback_data=f"ttt:cancel:{game_id}")],
             ]
         )
 
-    def sign_keyboard(self, game_id: str) -> InlineKeyboardMarkup:
+    def invite_keyboard(self, game_id: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [
-                    InlineKeyboardButton("❌ Choose X", callback_data=f"ttt:sign:x:{game_id}"),
-                    InlineKeyboardButton("0️⃣ Choose O", callback_data=f"ttt:sign:o:{game_id}"),
-                ],
-                [InlineKeyboardButton("🎲 Random", callback_data=f"ttt:sign:r:{game_id}")],
+                [InlineKeyboardButton("✅ Accept", callback_data=f"ttt:accept:{game_id}")],
+                [InlineKeyboardButton("❌ Decline", callback_data=f"ttt:decline:{game_id}")],
             ]
         )
 
-    async def log_event(self, group_id: int, game_id: Optional[str], type_: str, payload: Dict[str, Any], context: ContextTypes.DEFAULT_TYPE) -> None:
-        body = {"groupId": group_id, "gameId": game_id, "type": type_, "payload": payload}
+    def sign_keyboard(self, game_id: str, locked: Optional[str] = None) -> InlineKeyboardMarkup:
+        # locked: "x" or "o" to show disabled feel
+        if locked == "x":
+            row = [
+                InlineKeyboardButton("✅ ❌ X Selected", callback_data=f"ttt:noop:{game_id}"),
+                InlineKeyboardButton("0️⃣ Choose O", callback_data=f"ttt:sign:o:{game_id}"),
+            ]
+        elif locked == "o":
+            row = [
+                InlineKeyboardButton("❌ Choose X", callback_data=f"ttt:sign:x:{game_id}"),
+                InlineKeyboardButton("✅ 0️⃣ O Selected", callback_data=f"ttt:noop:{game_id}"),
+            ]
+        else:
+            row = [
+                InlineKeyboardButton("❌ Choose X", callback_data=f"ttt:sign:x:{game_id}"),
+                InlineKeyboardButton("0️⃣ Choose O", callback_data=f"ttt:sign:o:{game_id}"),
+            ]
+
+        return InlineKeyboardMarkup(
+            [
+                row,
+                [InlineKeyboardButton("🎲 Random", callback_data=f"ttt:sign:r:{game_id}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"ttt:cancel:{game_id}")],
+            ]
+        )
+
+    def active_keyboard(self, board: List[str], game_id: str, highlight: Optional[List[int]] = None) -> InlineKeyboardMarkup:
+        highlight = highlight or []
+        buttons: List[List[InlineKeyboardButton]] = []
+
+        for r in range(3):
+            row_btns: List[InlineKeyboardButton] = []
+            for c in range(3):
+                idx = r * 3 + c
+                cell = board[idx]
+                if not cell:
+                    label = "⬜️"
+                    cb = f"ttt:cell:{idx}:{game_id}"
+                else:
+                    sym = "❌" if cell == "X" else "0️⃣"
+                    if idx in highlight:
+                        sym = f"✨{sym}"
+                    label = sym
+                    cb = f"ttt:filled:{idx}:{game_id}"
+                row_btns.append(InlineKeyboardButton(label, callback_data=cb))
+            buttons.append(row_btns)
+
+        buttons.append([InlineKeyboardButton("🏳️ Flee", callback_data=f"ttt:flee:{game_id}")])
+        return InlineKeyboardMarkup(buttons)
+
+    # --------------------- Logging ---------------------
+
+    async def log_event(
+        self,
+        group_id: int,
+        game_id: Optional[str],
+        type_: str,
+        payload: Dict[str, Any],
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        body = {"groupId": group_id, "gameId": game_id, "type": type_, "payload": payload, "ts": utcnow()}
         self.mongo.log_event(body)
+
         group = self.mongo.groups.find_one({"_id": group_id})
         log_chat_id = group.get("logChatId") if group else None
         if log_chat_id:
@@ -126,157 +193,310 @@ class TicToeBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send log message: %s", exc)
 
-    # Command handlers
+    # --------------------- Background expiry ---------------------
+
+    async def _expiry_loop(self, app: Application) -> None:
+        # Cancels expired lobbies + optional turn timeouts.
+        # Requires Mongo methods:
+        # - list_expired_lobbies(now) -> list[game_docs]
+        # - list_expired_turns(now) -> list[game_docs]   (optional)
+        # - cancel_game(game_id, reason)
+        # If you don't have them yet, implement with simple queries on games collection.
+        while True:
+            try:
+                now = utcnow()
+
+                # Expire lobbies
+                for game in self.mongo.list_expired_lobbies(now):
+                    gid = game["groupId"]
+                    game_id = game["_id"]
+                    # Clear lock + mark cancelled
+                    self.mongo.record_result(game_id, {"type": "LOBBY_TIMEOUT", "winnerUserId": None, "line": None})
+                    self.mongo.clear_active_game_if_match(gid, game_id)
+                    self.mongo.update_game(game_id, {"$set": {"status": "CANCELLED", "updatedAt": now}})
+                    try:
+                        await app.bot.send_message(
+                            gid,
+                            build_card("Lobby expired", ["No one joined in time."], "Use /startgame to create a new lobby."),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                    await self.log_event(gid, game_id, "lobby_timeout", {}, app.bot_data.get("ctx") or None)  # safe no-op
+
+                # Optional: Turn timeouts (if you store lastMoveAt / updatedAt)
+                for game in self.mongo.list_expired_turns(now):
+                    gid = game["groupId"]
+                    game_id = game["_id"]
+                    if game.get("status") != "ACTIVE":
+                        continue
+                    turn = game.get("turn")
+                    loser = game["playerX"] if turn == "X" else game["playerO"]
+                    winner = game["playerO"] if turn == "X" else game["playerX"]
+                    self.mongo.record_result(game_id, {"type": "TURN_TIMEOUT", "winnerUserId": winner, "line": None})
+                    self.mongo.clear_active_game_if_match(gid, game_id)
+                    self.mongo.update_game(game_id, {"$set": {"status": "ENDED", "updatedAt": now}})
+                    self.mongo.bump_stats(winner, loser, draw=False)
+                    try:
+                        await app.bot.send_message(
+                            gid,
+                            build_card("Game over", [f"Winner (timeout): {winner}"], "Use /startgame for a new lobby."),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(10)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Expiry loop error: %s", exc)
+                await asyncio.sleep(10)
+
+    async def post_init(self, app: Application) -> None:
+        # Store a fake context handle for log_event calls from expiry loop
+        app.bot_data["ctx"] = None
+        self._expiry_task = asyncio.create_task(self._expiry_loop(app))
+
+    async def post_shutdown(self, app: Application) -> None:
+        if self._expiry_task:
+            self._expiry_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._expiry_task
+
+    # --------------------- Commands ---------------------
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
-            await update.message.reply_html(
+            await update.effective_message.reply_html(
                 build_card(
-                    "TicToe Bot",
+                    "TicTacToe Bot",
                     [
                         "Add me to a group and run /startgame",
-                        "One active game per group with stats and logs.",
+                        "One active game per group • Stats • Logs • Rematch",
                     ],
+                    "Group commands: /startgame /join /stats /groupstats",
                 )
             )
         else:
-            await update.message.reply_text("Hello! Use /startgame to begin a lobby.")
+            await update.effective_message.reply_text("Use /startgame to begin a lobby.")
 
     async def startgame(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        if not message or not update.effective_chat:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not chat or not user:
             return
-        if update.effective_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            await message.reply_text("Please use me in a group to play.")
+        if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await msg.reply_text("Please use me in a group to play.")
             return
-        self.mongo.upsert_user(
-            {
-                "_id": update.effective_user.id,
-                "name": update.effective_user.full_name,
-                "username": update.effective_user.username,
-            }
-        )
-        group = self.mongo.get_or_create_group({"id": update.effective_chat.id, "title": update.effective_chat.title})
+
+        self.mongo.upsert_user({"_id": user.id, "name": user.full_name, "username": user.username})
+        group = self.mongo.get_or_create_group({"id": chat.id, "title": chat.title})
+
         if group.get("activeGameId"):
-            await message.reply_html(
+            await msg.reply_html(
                 build_card(
                     "Game already active",
                     ["Only one lobby or game is allowed per group."],
-                    "Wait for it to finish or /forceend if you are an admin.",
+                    "Wait for it to finish, or admins can /forceend.",
                 )
             )
             return
 
+        # Create game id and attempt to lock group first (prevents orphans)
         game_id = str(uuid.uuid4())
-        now = dt.datetime.utcnow()
+        if not self.mongo.set_active_game_if_free(chat.id, game_id):
+            await msg.reply_text("Another game was just created. Try again.")
+            return
+
+        now = utcnow()
+        join_until = now + dt.timedelta(seconds=self.settings.join_timeout_sec)
+
         game_doc = {
             "_id": game_id,
-            "groupId": update.effective_chat.id,
+            "groupId": chat.id,
             "status": "LOBBY",
             "createdAt": now,
             "updatedAt": now,
-            "createdBy": update.effective_user.id,
-            "joinMode": "open",
-            "invitedUser": None,
-            "joinExpiresAt": None,
+            "createdBy": user.id,
+            "hostId": user.id,
+            "joinMode": "open",                 # open | invite
+            "invitedUser": None,                # user id (optional)
+            "invitedUsername": None,            # username (optional fallback)
+            "joinExpiresAt": join_until,
             "playerX": None,
             "playerO": None,
-            "players": [update.effective_user.id],
+            "players": [user.id],
             "board": ["" for _ in range(9)],
             "turn": None,
             "moves": [],
             "messageRefs": {},
             "result": None,
         }
-        self.mongo.create_game(game_doc)
-        if not self.mongo.set_active_game_if_free(update.effective_chat.id, game_id):
-            await message.reply_text("Another game was just created. Try again shortly.")
-            return
+
+        try:
+            self.mongo.create_game(game_doc)
+        except Exception:
+            # rollback lock if insert fails
+            self.mongo.clear_active_game_if_match(chat.id, game_id)
+            raise
 
         text = build_card(
-            "TicToe Lobby",
+            "🎮 TicTacToe Lobby",
             [
-                f"Host: {update.effective_user.mention_html()}",
-                "Waiting for challenger...",
+                f"Host: {user.mention_html()}",
+                "Challenger: <i>Waiting…</i>",
+                f"Expires in: <b>{self.settings.join_timeout_sec}s</b>",
             ],
-            "Use /join or press the button.",
+            "Use /join or press ✅ Join Game",
         )
-        sent = await message.reply_html(text, reply_markup=self.lobby_keyboard(game_id))
+        sent = await msg.reply_html(text, reply_markup=self.lobby_keyboard(game_id))
         self.mongo.update_game(game_id, {"$set": {"messageRefs.lobbyMsgId": sent.message_id}})
-        await self.log_event(update.effective_chat.id, game_id, "lobby_created", {"host": update.effective_user.id}, context)
+        await self.log_event(chat.id, game_id, "lobby_created", {"host": user.id}, context)
 
     async def join(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        if not message or not update.effective_chat:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not chat or not user:
             return
-        if update.effective_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-            await message.reply_text("Join only works inside a group lobby.")
+        if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await msg.reply_text("Join works inside a group lobby.")
             return
-        group_id = update.effective_chat.id
-        game = self.current_game(group_id)
+
+        game = self.current_game(chat.id)
         if not game or game.get("status") not in {"LOBBY", "SIGN_PICK"}:
-            await message.reply_text("No active lobby. Use /startgame first.")
+            await msg.reply_text("No active lobby. Use /startgame first.")
             return
 
-        from_user = update.effective_user
-        self.mongo.upsert_user({"_id": from_user.id, "name": from_user.full_name, "username": from_user.username})
+        self.mongo.upsert_user({"_id": user.id, "name": user.full_name, "username": user.username})
 
-        target_user: Optional[int] = None
-        if message.reply_to_message and message.reply_to_message.from_user:
-            target_user = message.reply_to_message.from_user.id
+        # Invite flow:
+        # Preferred: reply to a user's message -> we get user_id
+        # Optional: /join @username -> store invitedUsername, accept checks query.from_user.username
+        target_user_id: Optional[int] = None
+        target_username: Optional[str] = None
 
-        if target_user and target_user != from_user.id:
-            join_until = dt.datetime.utcnow() + dt.timedelta(seconds=self.settings.join_timeout_sec)
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            target_user_id = msg.reply_to_message.from_user.id
+
+        if context.args and context.args[0].startswith("@"):
+            target_username = context.args[0].lstrip("@").strip() or None
+
+        if (target_user_id or target_username) and (game.get("status") == "LOBBY"):
+            join_until = utcnow() + dt.timedelta(seconds=self.settings.join_timeout_sec)
+
+            if target_user_id and target_user_id == user.id:
+                await msg.reply_text("You can't invite yourself.")
+                return
+
             self.mongo.update_game(
                 game["_id"],
-                {"$set": {"joinMode": "invite", "invitedUser": target_user, "joinExpiresAt": join_until}},
+                {
+                    "$set": {
+                        "joinMode": "invite",
+                        "invitedUser": target_user_id,
+                        "invitedUsername": target_username,
+                        "joinExpiresAt": join_until,
+                        "updatedAt": utcnow(),
+                    }
+                },
             )
+
+            invite_line = (
+                f"Invited: {mention_html(target_user_id, 'Player')}" if target_user_id
+                else f"Invited username: <code>@{target_username}</code>"
+            )
+
             text = build_card(
-                "Invitation sent",
+                "📨 Invitation sent",
                 [
-                    f"Host: <b>{from_user.full_name}</b>",
-                    f"Invited: <code>{target_user}</code>",
-                    "Awaiting acceptance...",
+                    f"Host: {user.mention_html()}",
+                    invite_line,
+                    f"Expires in: <b>{self.settings.join_timeout_sec}s</b>",
                 ],
+                "Only the invited user can accept.",
             )
-            buttons = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("✅ Accept", callback_data=f"ttt:accept:{game['_id']}")],
-                    [InlineKeyboardButton("❌ Decline", callback_data=f"ttt:decline:{game['_id']}")],
-                ]
-            )
-            await message.reply_html(text, reply_markup=buttons)
-            await self.log_event(group_id, game["_id"], "invite_sent", {"to": target_user, "by": from_user.id}, context)
+            await msg.reply_html(text, reply_markup=self.invite_keyboard(game["_id"]))
+            await self.log_event(chat.id, game["_id"], "invite_sent", {"to": target_user_id, "toUsername": target_username, "by": user.id}, context)
             return
 
-        if from_user.id in game.get("players", []):
-            await message.reply_text("You are already in the lobby.")
+        # Normal join (open lobby)
+        if user.id in game.get("players", []):
+            await msg.reply_text("You are already in the lobby.")
             return
+
         players = game.get("players", [])
         if len(players) >= 2:
-            await message.reply_text("Lobby already has two players.")
+            await msg.reply_text("Lobby already has two players.")
             return
-        players.append(from_user.id)
-        new_status = "SIGN_PICK" if len(players) == 2 else "LOBBY"
-        updated = self.mongo.update_game(game["_id"], {"$set": {"players": players, "status": new_status}})
-        await self.log_event(group_id, game["_id"], "player_join", {"player": from_user.id}, context)
-        if new_status == "SIGN_PICK":
-            await self.prompt_sign_choice(update, context, updated)
-        else:
-            await message.reply_text(f"{from_user.mention_html()} joined the lobby!", parse_mode=ParseMode.HTML)
 
-    async def prompt_sign_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE, game: Dict) -> None:
+        players.append(user.id)
+        new_status = "SIGN_PICK" if len(players) == 2 else "LOBBY"
+        updated = self.mongo.update_game(game["_id"], {"$set": {"players": players, "status": new_status, "updatedAt": utcnow()}})
+
+        await self.log_event(chat.id, game["_id"], "player_join", {"player": user.id}, context)
+
+        # Edit lobby message instead of sending new noise
+        await self.render_lobby_or_sign(updated, context)
+
+    async def render_lobby_or_sign(self, game: Dict, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = game["groupId"]
         lobby_msg_id = game.get("messageRefs", {}).get("lobbyMsgId")
+
+        players = game.get("players", [])
+        host_id = players[0] if players else game.get("hostId")
+
+        # Show lobby or sign pick depending on state
+        if game.get("status") == "SIGN_PICK" and len(players) >= 2:
+            await self.prompt_sign_choice(chat_id, lobby_msg_id, game, context)
+            return
+
+        body = [
+            f"Host: <code>{host_id}</code>",
+            f"Challenger: <i>{'Waiting…' if len(players) < 2 else players[1]}</i>",
+        ]
+        if game.get("joinExpiresAt"):
+            remain = int((game["joinExpiresAt"] - utcnow()).total_seconds())
+            remain = max(remain, 0)
+            body.append(f"Expires in: <b>{remain}s</b>")
+
+        text = build_card("🎮 TicTacToe Lobby", body, "Use /join or press ✅ Join Game")
+        markup = self.lobby_keyboard(game["_id"])
+
+        if lobby_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=lobby_msg_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                )
+                return
+            except Exception:
+                pass
+
+        sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        self.mongo.update_game(game["_id"], {"$set": {"messageRefs.lobbyMsgId": sent.message_id}})
+
+    async def prompt_sign_choice(self, chat_id: int, lobby_msg_id: Optional[int], game: Dict, context: ContextTypes.DEFAULT_TYPE) -> None:
         players = game.get("players", [])
         if len(players) < 2:
             return
-        p1, p2 = players[0], players[1]
+
         text = build_card(
-            "Choose your sign",
-            [f"{p1} vs {p2}", "First choice locks the mapping."],
-            "Tap X or O",
+            "🎭 Choose your sign",
+            [
+                f"Players: <code>{players[0]}</code> vs <code>{players[1]}</code>",
+                "First valid choice locks the mapping.",
+            ],
+            "Tap ❌ or 0️⃣ (or 🎲 Random)",
         )
         markup = self.sign_keyboard(game["_id"])
+
         if lobby_msg_id:
             try:
                 await context.bot.edit_message_text(
@@ -289,191 +509,9 @@ class TicToeBot:
                 return
             except Exception:
                 logger.info("Could not edit lobby message; sending new sign prompt")
-        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
-    async def handle_sign(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
-            return
-        if self._throttle(query.from_user.id):
-            await query.answer("Slow down")
-            return
-        parts = query.data.split(":")
-        _, _, choice, game_id = parts
-        game = self.mongo.fetch_game(game_id)
-        if not game or game.get("status") != "SIGN_PICK":
-            await query.answer("Game not available.", show_alert=True)
-            return
-        players = game.get("players", [])
-        if query.from_user.id not in players:
-            await query.answer("Only players can pick.", show_alert=True)
-            return
-        if game.get("playerX") or game.get("playerO"):
-            await query.answer("Sign already chosen.", show_alert=True)
-            return
-        p1, p2 = players[0], players[1]
-        if choice == "r":
-            choice = "x" if uuid.uuid4().int % 2 == 0 else "o"
-        if choice == "x":
-            player_x, player_o = p1, p2
-        else:
-            player_x, player_o = p2, p1
-        updated = self.mongo.update_game(
-            game_id,
-            {"$set": {"playerX": player_x, "playerO": player_o, "turn": "X", "status": "ACTIVE"}},
-        )
-        await query.answer("Signs locked. Game start!")
-        await self.start_board(updated, context)
-        await self.log_event(game["groupId"], game_id, "sign_selected", {"playerX": player_x, "playerO": player_o}, context)
-
-    async def start_board(self, game: Dict, context: ContextTypes.DEFAULT_TYPE) -> None:
-        board = game.get("board", ["" for _ in range(9)])
-        text, markup = board_markup(board, game["_id"])
-        caption = build_card(
-            "Game started",
-            [f"❌ {game['playerX']}  vs  0️⃣ {game['playerO']}", "Turn: ❌"],
-            "Tap a cell to move",
-        )
-        msg = await context.bot.send_message(game["groupId"], f"{caption}\n{text}", parse_mode=ParseMode.HTML, reply_markup=markup)
-        self.mongo.update_game(game["_id"], {"$set": {"messageRefs.gameMsgId": msg.message_id}})
-
-    async def handle_cell(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
-            return
-        if self._throttle(query.from_user.id):
-            await query.answer("Hold on")
-            return
-        parts = query.data.split(":")
-        if len(parts) < 4:
-            await query.answer("Malformed move", show_alert=True)
-            return
-        idx = int(parts[2])
-        game_id = parts[3]
-        game = self.mongo.fetch_game(game_id)
-        if not game or game.get("status") != "ACTIVE":
-            await query.answer("Game finished.", show_alert=True)
-            return
-        group = self.mongo.groups.find_one({"_id": game["groupId"]})
-        if group and group.get("activeGameId") != game_id:
-            await query.answer("Stale game.", show_alert=True)
-            return
-        player_symbol = "X" if query.from_user.id == game.get("playerX") else "O" if query.from_user.id == game.get("playerO") else None
-        if not player_symbol:
-            await query.answer("You are not in this game.", show_alert=True)
-            return
-        if game.get("turn") != player_symbol:
-            await query.answer("Not your turn.", show_alert=True)
-            return
-        board = game.get("board", ["" for _ in range(9)])
-        if board[idx]:
-            await query.answer("Cell already taken", show_alert=True)
-            return
-        board[idx] = player_symbol
-        move = {"by": query.from_user.id, "symbol": player_symbol, "idx": idx, "ts": dt.datetime.utcnow()}
-        self.mongo.update_game(
-            game_id,
-            {"$set": {"board": board, "turn": "O" if player_symbol == "X" else "X", "updatedAt": dt.datetime.utcnow()}, "$push": {"moves": move}},
-        )
-        winner, line = check_winner(board)
-        chat_id = game["groupId"]
-        msg_id = game.get("messageRefs", {}).get("gameMsgId")
-        text, markup = board_markup(board, game_id, highlight=line or [])
-        next_turn = "O" if player_symbol == "X" else "X"
-        status_lines = [f"❌ {game['playerX']} vs 0️⃣ {game['playerO']}"]
-        if winner == "DRAW":
-            status_lines.append("Result: Draw")
-        elif winner:
-            winner_id = game["playerX"] if winner == "X" else game["playerO"]
-            status_lines.append(f"Winner: {winner_id}")
-        else:
-            turn_user = game["playerX"] if next_turn == "X" else game.get("playerO")
-            status_lines.append(f"Turn: {turn_user}")
-        caption = build_card("TicToe", status_lines)
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=f"{caption}\n{text}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=None if winner else markup,
-            )
-        except Exception:
-            await context.bot.send_message(chat_id, f"{caption}\n{text}", parse_mode=ParseMode.HTML, reply_markup=None if winner else markup)
-        if winner:
-            result_type = "DRAW" if winner == "DRAW" else "WIN"
-            winner_id = None if winner == "DRAW" else (game["playerX"] if winner == "X" else game["playerO"])
-            loser_id = None if winner == "DRAW" else (game["playerO"] if winner == "X" else game["playerX"])
-            self.mongo.record_result(game_id, {"type": result_type, "winnerUserId": winner_id, "line": line})
-            self.mongo.clear_active_game_if_match(chat_id, game_id)
-            self.mongo.bump_stats(winner_id, loser_id, draw=winner == "DRAW")
-            await self.log_event(chat_id, game_id, "game_ended", {"winner": winner_id, "draw": winner == "DRAW"}, context)
-            await context.bot.send_message(
-                chat_id,
-                build_card(
-                    "Game over",
-                    [f"Winner: {winner_id}" if winner_id else "Draw!"],
-                    "Use 🔄 Rematch or 🏁 New Game",
-                ),
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("🔄 Rematch", callback_data=f"ttt:rematch:{game_id}")],
-                        [InlineKeyboardButton("🏁 New Game", callback_data=f"ttt:new:{game_id}")],
-                    ]
-                ),
-            )
-        else:
-            await query.answer()
-
-    async def flee(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        game_id = None
-        if query and query.data:
-            parts = query.data.split(":")
-            if len(parts) >= 3:
-                game_id = parts[2]
-        if update.effective_chat:
-            game = self.current_game(update.effective_chat.id)
-        else:
-            game = None
-        if game_id and (not game or game["_id"] != game_id):
-            game = self.mongo.fetch_game(game_id)
-        if not game:
-            if query:
-                await query.answer("No active game")
-            return
-        if game.get("status") == "ACTIVE":
-            opponent = None
-            if query and query.from_user.id == game.get("playerX"):
-                opponent = game.get("playerO")
-            elif query and query.from_user.id == game.get("playerO"):
-                opponent = game.get("playerX")
-            result = {"type": "FORFEIT", "winnerUserId": opponent, "line": None}
-            self.mongo.record_result(game["_id"], result)
-            self.mongo.bump_stats(opponent, query.from_user.id if query else None, draw=False)
-        self.mongo.clear_active_game_if_match(game["groupId"], game["_id"])
-        if query:
-            await query.answer("Game ended")
-        await context.bot.send_message(
-            game["groupId"],
-            build_card("Game cancelled", ["Lobby closed or player fled."], "Use /startgame to play again."),
-        )
-        await self.log_event(game["groupId"], game["_id"], "flee", {"by": query.from_user.id if query else None}, context)
-
-    async def forceend(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_chat or not update.effective_user:
-            return
-        member = await update.effective_chat.get_member(update.effective_user.id)
-        if member.status not in {"administrator", "creator"} and not is_owner(update.effective_user.id, self.settings):
-            await update.message.reply_text("Admins only.")
-            return
-        game = self.current_game(update.effective_chat.id)
-        if not game:
-            await update.message.reply_text("No active game.")
-            return
-        self.mongo.clear_active_game_if_match(update.effective_chat.id, game["_id"])
-        await update.message.reply_text("Game forcibly ended.")
-        await self.log_event(update.effective_chat.id, game["_id"], "forceend", {"by": update.effective_user.id}, context)
+        sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        self.mongo.update_game(game["_id"], {"$set": {"messageRefs.lobbyMsgId": sent.message_id}})
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user:
@@ -481,10 +519,10 @@ class TicToeBot:
         doc = self.mongo.user_stats(update.effective_user.id) or {}
         stats = doc.get("stats") or {"wins": 0, "losses": 0, "draws": 0, "gamesPlayed": 0}
         body = [
-            f"Wins: {stats.get('wins',0)}",
-            f"Losses: {stats.get('losses',0)}",
-            f"Draws: {stats.get('draws',0)}",
-            f"Games: {stats.get('gamesPlayed',0)}",
+            f"Wins: {stats.get('wins', 0)}",
+            f"Losses: {stats.get('losses', 0)}",
+            f"Draws: {stats.get('draws', 0)}",
+            f"Games: {stats.get('gamesPlayed', 0)}",
         ]
         await update.effective_message.reply_html(build_card("Your stats", body))
 
@@ -493,123 +531,517 @@ class TicToeBot:
             return
         stats = self.mongo.group_stats(update.effective_chat.id)
         body = [
-            f"Total games: {stats['total']}",
-            f"Wins: {stats['wins']}",
-            f"Draws: {stats['draws']}",
-            f"Losses: {stats['losses']}",
+            f"Total games: {stats.get('total', 0)}",
+            f"Wins: {stats.get('wins', 0)}",
+            f"Draws: {stats.get('draws', 0)}",
+            f"Losses: {stats.get('losses', 0)}",
         ]
         await update.effective_message.reply_html(build_card("Group stats", body))
 
     async def broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_owner(update.effective_user.id, self.settings):
-            await update.message.reply_text("Owner only")
+            await update.effective_message.reply_text("Owner only")
             return
         if not context.args:
-            await update.message.reply_text("Usage: /broadcast <message>")
+            await update.effective_message.reply_text("Usage: /broadcast <message>")
             return
         msg = " ".join(context.args)
-        successes = 0
+
+        successes, fails = 0, 0
         for gid in self.mongo.all_group_ids():
             try:
                 await context.bot.send_message(gid, msg)
                 successes += 1
                 await asyncio.sleep(0.25)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Broadcast to %s failed: %s", gid, exc)
-        await update.message.reply_text(f"Broadcast delivered to {successes} chats")
+            except RetryAfter as e:
+                await asyncio.sleep(float(e.retry_after) + 0.2)
+            except (TimedOut, Exception):  # noqa: BLE001
+                fails += 1
+
+        await update.effective_message.reply_text(f"Broadcast done ✅ {successes} / ❌ {fails}")
 
     async def setloggroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_chat or not update.effective_user:
             return
         member = await update.effective_chat.get_member(update.effective_user.id)
         if member.status not in {"administrator", "creator"} and not is_owner(update.effective_user.id, self.settings):
-            await update.message.reply_text("Admins only.")
+            await update.effective_message.reply_text("Admins only.")
             return
         if not context.args:
-            await update.message.reply_text("Usage: /setloggroup <chat_id|null>")
+            await update.effective_message.reply_text("Usage: /setloggroup <chat_id|null>")
             return
         arg = context.args[0]
         log_chat_id = None if arg.lower() == "null" else int(arg)
         self.mongo.set_log_group(update.effective_chat.id, log_chat_id)
-        await update.message.reply_text("Log destination updated")
+        await update.effective_message.reply_text("Log destination updated ✅")
+
+    async def forceend(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_chat or not update.effective_user:
+            return
+        member = await update.effective_chat.get_member(update.effective_user.id)
+        if member.status not in {"administrator", "creator"} and not is_owner(update.effective_user.id, self.settings):
+            await update.effective_message.reply_text("Admins only.")
+            return
+
+        game = self.current_game(update.effective_chat.id)
+        if not game:
+            await update.effective_message.reply_text("No active game.")
+            return
+
+        self.mongo.record_result(game["_id"], {"type": "ADMIN_END", "winnerUserId": None, "line": None})
+        self.mongo.update_game(game["_id"], {"$set": {"status": "ENDED", "updatedAt": utcnow()}})
+        self.mongo.clear_active_game_if_match(update.effective_chat.id, game["_id"])
+        await update.effective_message.reply_text("Game forcibly ended ✅")
+        await self.log_event(update.effective_chat.id, game["_id"], "forceend", {"by": update.effective_user.id}, context)
+
+    # --------------------- Callbacks ---------------------
+
+    async def noop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q:
+            await q.answer("Not available.", show_alert=False)
+
+    async def filled_cell(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q:
+            await q.answer("Cell already taken.", show_alert=False)
+
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if not q or not q.data:
+            return
+        if self._throttle(q.from_user.id):
+            await q.answer("Slow down")
+            return
+
+        parts = q.data.split(":")
+        game_id = parts[2]
+        game = self.mongo.fetch_game(game_id)
+        if not game:
+            await q.answer("Lobby not found", show_alert=True)
+            return
+
+        chat_id = game["groupId"]
+
+        # Permission: host/admin/owner can cancel
+        allowed = False
+        try:
+            member = await context.bot.get_chat_member(chat_id, q.from_user.id)
+            allowed = member.status in {"administrator", "creator"} or q.from_user.id == game.get("hostId")
+        except Exception:
+            allowed = q.from_user.id == game.get("hostId")
+
+        if not allowed and not is_owner(q.from_user.id, self.settings):
+            await q.answer("Only host/admin can cancel.", show_alert=True)
+            return
+
+        self.mongo.record_result(game_id, {"type": "CANCELLED", "winnerUserId": None, "line": None})
+        self.mongo.update_game(game_id, {"$set": {"status": "CANCELLED", "updatedAt": utcnow()}})
+        self.mongo.clear_active_game_if_match(chat_id, game_id)
+        await q.answer("Cancelled ✅")
+        await context.bot.send_message(chat_id, build_card("Lobby cancelled", ["Lobby closed."], "Use /startgame to play again."), parse_mode=ParseMode.HTML)
+        await self.log_event(chat_id, game_id, "cancelled", {"by": q.from_user.id}, context)
 
     async def accept_invite(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
+        q = update.callback_query
+        if not q or not q.data:
             return
-        if self._throttle(query.from_user.id):
-            await query.answer("Slow")
+        if self._throttle(q.from_user.id):
+            await q.answer("Slow")
             return
-        parts = query.data.split(":")
-        game_id = parts[2]
+
+        game_id = q.data.split(":")[2]
         game = self.mongo.fetch_game(game_id)
         if not game or game.get("status") != "LOBBY":
-            await query.answer("Lobby expired", show_alert=True)
+            await q.answer("Lobby expired", show_alert=True)
             return
-        invited = game.get("invitedUser")
-        if invited != query.from_user.id:
-            await query.answer("Not your invite", show_alert=True)
+
+        # Validate invite by user id OR username
+        invited_id = game.get("invitedUser")
+        invited_username = game.get("invitedUsername")
+        if invited_id and invited_id != q.from_user.id:
+            await q.answer("Not your invite", show_alert=True)
             return
+        if (not invited_id) and invited_username:
+            if not q.from_user.username or q.from_user.username.lower() != invited_username.lower():
+                await q.answer("Not your invite", show_alert=True)
+                return
+
         players = game.get("players", [])
         if len(players) >= 2:
-            await query.answer("Lobby full", show_alert=True)
+            await q.answer("Lobby full", show_alert=True)
             return
-        players.append(query.from_user.id)
-        updated = self.mongo.update_game(game_id, {"$set": {"players": players, "status": "SIGN_PICK"}})
-        await query.answer("Joined! Pick a sign")
-        await self.prompt_sign_choice(update, context, updated)
-        await self.log_event(game["groupId"], game_id, "invite_accepted", {"by": query.from_user.id}, context)
+
+        players.append(q.from_user.id)
+        updated = self.mongo.update_game(game_id, {"$set": {"players": players, "status": "SIGN_PICK", "updatedAt": utcnow()}})
+
+        await q.answer("Joined! Pick a sign ✅")
+        await self.render_lobby_or_sign(updated, context)
+        await self.log_event(game["groupId"], game_id, "invite_accepted", {"by": q.from_user.id}, context)
 
     async def decline_invite(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
+        q = update.callback_query
+        if not q or not q.data:
             return
-        if self._throttle(query.from_user.id):
-            await query.answer("Slow")
+        if self._throttle(q.from_user.id):
+            await q.answer("Slow")
             return
-        parts = query.data.split(":")
-        game_id = parts[2]
+
+        game_id = q.data.split(":")[2]
         game = self.mongo.fetch_game(game_id)
         if not game:
-            await query.answer("Lobby gone", show_alert=True)
+            await q.answer("Lobby gone", show_alert=True)
             return
-        await query.answer("Declined")
-        await context.bot.send_message(game["groupId"], "Invitation declined.")
-        await self.log_event(game["groupId"], game_id, "invite_declined", {"by": query.from_user.id}, context)
+
+        # Only invited user can decline
+        invited_id = game.get("invitedUser")
+        invited_username = game.get("invitedUsername")
+        allowed = (invited_id == q.from_user.id) or (invited_username and q.from_user.username and q.from_user.username.lower() == invited_username.lower())
+        if not allowed:
+            await q.answer("Not your invite", show_alert=True)
+            return
+
+        self.mongo.record_result(game_id, {"type": "INVITE_DECLINED", "winnerUserId": None, "line": None})
+        self.mongo.update_game(game_id, {"$set": {"status": "CANCELLED", "updatedAt": utcnow()}})
+        self.mongo.clear_active_game_if_match(game["groupId"], game_id)
+
+        await q.answer("Declined")
+        await context.bot.send_message(game["groupId"], build_card("Invite declined", ["Lobby closed."], "Use /startgame to play again."), parse_mode=ParseMode.HTML)
+        await self.log_event(game["groupId"], game_id, "invite_declined", {"by": q.from_user.id}, context)
+
+    async def handle_sign(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if not q or not q.data:
+            return
+        if self._throttle(q.from_user.id):
+            await q.answer("Slow down")
+            return
+
+        _, _, choice, game_id = q.data.split(":")
+        game = self.mongo.fetch_game(game_id)
+        if not game or game.get("status") != "SIGN_PICK":
+            await q.answer("Game not available.", show_alert=True)
+            return
+
+        players = game.get("players", [])
+        if q.from_user.id not in players:
+            await q.answer("Only players can pick.", show_alert=True)
+            return
+
+        if game.get("playerX") or game.get("playerO"):
+            await q.answer("Sign already chosen.", show_alert=True)
+            return
+
+        chooser = q.from_user.id
+        other = players[0] if players[1] == chooser else players[1]
+
+        if choice == "r":
+            choice = random.choice(["x", "o"])
+
+        locked = "x" if choice == "x" else "o"
+        # Immediate UI lock feel
+        lobby_msg_id = game.get("messageRefs", {}).get("lobbyMsgId")
+        if lobby_msg_id:
+            try:
+                text = build_card(
+                    "🎭 Choose your sign",
+                    [
+                        f"Players: <code>{players[0]}</code> vs <code>{players[1]}</code>",
+                        "Locking selection…",
+                    ],
+                )
+                await context.bot.edit_message_text(
+                    chat_id=game["groupId"],
+                    message_id=lobby_msg_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self.sign_keyboard(game_id, locked=locked),
+                )
+            except Exception:
+                pass
+
+        if choice == "x":
+            player_x, player_o = chooser, other
+        else:
+            player_o, player_x = chooser, other
+
+        updated = self.mongo.update_game(
+            game_id,
+            {"$set": {"playerX": player_x, "playerO": player_o, "turn": "X", "status": "ACTIVE", "updatedAt": utcnow()}},
+        )
+
+        await q.answer("Signs locked ✅ Game started!")
+        await self.start_board(updated, context)
+        await self.log_event(game["groupId"], game_id, "sign_selected", {"playerX": player_x, "playerO": player_o, "by": chooser}, context)
+
+    async def start_board(self, game: Dict, context: ContextTypes.DEFAULT_TYPE) -> None:
+        board = game.get("board") or ["" for _ in range(9)]
+        caption = build_card(
+            "🎮 TicTacToe",
+            [
+                f"❌ <code>{game['playerX']}</code>  vs  0️⃣ <code>{game['playerO']}</code>",
+                f"Turn: ❌ (<code>{game['playerX']}</code>)",
+            ],
+            "Tap a cell to move",
+        )
+        markup = self.active_keyboard(board, game["_id"])
+        msg = await context.bot.send_message(
+            game["groupId"],
+            caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+        self.mongo.update_game(game["_id"], {"$set": {"messageRefs.gameMsgId": msg.message_id}})
+
+    async def handle_cell(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if not q or not q.data:
+            return
+        if self._throttle(q.from_user.id):
+            await q.answer("Hold on")
+            return
+
+        parts = q.data.split(":")
+        if len(parts) < 4:
+            await q.answer("Malformed move", show_alert=True)
+            return
+
+        idx = int(parts[2])
+        game_id = parts[3]
+
+        game = self.mongo.fetch_game(game_id)
+        if not game or game.get("status") != "ACTIVE":
+            await q.answer("Game finished.", show_alert=True)
+            return
+
+        group = self.mongo.groups.find_one({"_id": game["groupId"]})
+        if group and group.get("activeGameId") != game_id:
+            await q.answer("Stale game.", show_alert=True)
+            return
+
+        # Determine player symbol
+        if q.from_user.id == game.get("playerX"):
+            symbol = "X"
+        elif q.from_user.id == game.get("playerO"):
+            symbol = "O"
+        else:
+            await q.answer("You are not in this game.", show_alert=True)
+            return
+
+        if game.get("turn") != symbol:
+            await q.answer("Not your turn.", show_alert=False)
+            return
+
+        board = game.get("board") or ["" for _ in range(9)]
+        if board[idx]:
+            await q.answer("Cell already taken.", show_alert=False)
+            return
+
+        board[idx] = symbol
+        next_turn = "O" if symbol == "X" else "X"
+        move = {"by": q.from_user.id, "symbol": symbol, "idx": idx, "ts": utcnow()}
+
+        self.mongo.update_game(
+            game_id,
+            {
+                "$set": {"board": board, "turn": next_turn, "updatedAt": utcnow()},
+                "$push": {"moves": move},
+            },
+        )
+
+        winner, line = check_winner(board)
+        chat_id = game["groupId"]
+        msg_id = game.get("messageRefs", {}).get("gameMsgId")
+
+        if winner == "DRAW":
+            caption = build_card(
+                "🎮 TicTacToe",
+                [f"❌ <code>{game['playerX']}</code>  vs  0️⃣ <code>{game['playerO']}</code>", "Result: <b>Draw</b>"],
+                "Use 🔄 Rematch or /startgame",
+            )
+            markup = self.active_keyboard(board, game_id, highlight=[])
+            # End game
+            self.mongo.record_result(game_id, {"type": "DRAW", "winnerUserId": None, "line": None})
+            self.mongo.update_game(game_id, {"$set": {"status": "ENDED", "updatedAt": utcnow()}})
+            self.mongo.clear_active_game_if_match(chat_id, game_id)
+
+            # Ensure both players stats update (no None crash)
+            self.mongo.bump_stats(game["playerX"], game["playerO"], draw=True)
+
+            await self._edit_or_send_board(chat_id, msg_id, caption, markup=None, context=context)
+            await self.log_event(chat_id, game_id, "game_ended", {"draw": True}, context)
+            await self._send_end_buttons(chat_id, game_id, context)
+            await q.answer()
+            return
+
+        if winner in {"X", "O"}:
+            winner_id = game["playerX"] if winner == "X" else game["playerO"]
+            loser_id = game["playerO"] if winner == "X" else game["playerX"]
+
+            caption = build_card(
+                "🏁 Game Over",
+                [
+                    f"Winner: <code>{winner_id}</code>",
+                    f"Line: <code>{line}</code>",
+                ],
+                "Use 🔄 Rematch or /startgame",
+            )
+            end_markup = self.active_keyboard(board, game_id, highlight=line or [])
+
+            self.mongo.record_result(game_id, {"type": "WIN", "winnerUserId": winner_id, "line": line})
+            self.mongo.update_game(game_id, {"$set": {"status": "ENDED", "updatedAt": utcnow()}})
+            self.mongo.clear_active_game_if_match(chat_id, game_id)
+            self.mongo.bump_stats(winner_id, loser_id, draw=False)
+
+            await self._edit_or_send_board(chat_id, msg_id, caption, markup=None, context=context)  # no clicks after end
+            # Optionally send a final highlighted board view
+            try:
+                await context.bot.send_message(chat_id, "✨ Final Board:", reply_markup=end_markup)
+            except Exception:
+                pass
+
+            await self.log_event(chat_id, game_id, "game_ended", {"winner": winner_id, "draw": False}, context)
+            await self._send_end_buttons(chat_id, game_id, context)
+            await q.answer()
+            return
+
+        # Normal continue
+        turn_user = game["playerX"] if next_turn == "X" else game["playerO"]
+        caption = build_card(
+            "🎮 TicTacToe",
+            [
+                f"❌ <code>{game['playerX']}</code>  vs  0️⃣ <code>{game['playerO']}</code>",
+                f"Turn: {'❌' if next_turn == 'X' else '0️⃣'} (<code>{turn_user}</code>)",
+            ],
+            "Tap a cell to move",
+        )
+        markup = self.active_keyboard(board, game_id)
+        await self._edit_or_send_board(chat_id, msg_id, caption, markup=markup, context=context)
+        await q.answer()
+
+    async def _edit_or_send_board(
+        self,
+        chat_id: int,
+        msg_id: Optional[int],
+        caption: str,
+        markup: Optional[InlineKeyboardMarkup],
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                )
+                return
+            except Exception:
+                pass
+        await context.bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def _send_end_buttons(self, chat_id: int, game_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 Rematch", callback_data=f"ttt:rematch:{game_id}")],
+                [InlineKeyboardButton("🏁 New Game", callback_data=f"ttt:new:{game_id}")],
+            ]
+        )
+        await context.bot.send_message(chat_id, "What next?", reply_markup=kb)
+
+    async def flee(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if not q or not q.data:
+            return
+        if self._throttle(q.from_user.id):
+            await q.answer("Slow")
+            return
+
+        game_id = q.data.split(":")[2]
+        game = self.mongo.fetch_game(game_id)
+        if not game:
+            await q.answer("No active game", show_alert=True)
+            return
+
+        chat_id = game["groupId"]
+        status = game.get("status")
+
+        if status == "LOBBY":
+            # Treat as cancel lobby (host/admin only)
+            await self.cancel(update, context)
+            return
+
+        if status != "ACTIVE":
+            await q.answer("Game already ended.", show_alert=True)
+            return
+
+        # Only players can flee
+        if q.from_user.id not in {game.get("playerX"), game.get("playerO")}:
+            await q.answer("Players only.", show_alert=True)
+            return
+
+        opponent = game["playerO"] if q.from_user.id == game.get("playerX") else game["playerX"]
+
+        self.mongo.record_result(game_id, {"type": "FORFEIT", "winnerUserId": opponent, "line": None})
+        self.mongo.update_game(game_id, {"$set": {"status": "ENDED", "updatedAt": utcnow()}})
+        self.mongo.clear_active_game_if_match(chat_id, game_id)
+        self.mongo.bump_stats(opponent, q.from_user.id, draw=False)
+
+        await q.answer("You fled.")
+        await context.bot.send_message(
+            chat_id,
+            build_card("🏁 Game Over", [f"Winner (forfeit): <code>{opponent}</code>"], "Use /startgame for a new lobby."),
+            parse_mode=ParseMode.HTML,
+        )
+        await self.log_event(chat_id, game_id, "forfeit", {"by": q.from_user.id, "winner": opponent}, context)
 
     async def rematch(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
+        q = update.callback_query
+        if not q or not q.data:
             return
-        parts = query.data.split(":")
-        game_id = parts[2]
-        game = self.mongo.fetch_game(game_id)
-        if not game:
-            await query.answer("Game missing", show_alert=True)
+        if self._throttle(q.from_user.id):
+            await q.answer("Slow")
             return
-        players = game.get("players", [])
-        if query.from_user.id not in players:
-            await query.answer("Players only", show_alert=True)
+
+        game_id = q.data.split(":")[2]
+        prev = self.mongo.fetch_game(game_id)
+        if not prev:
+            await q.answer("Game missing", show_alert=True)
             return
-        group_id = game["groupId"]
-        if self.mongo.groups.find_one({"_id": group_id}).get("activeGameId"):
-            await query.answer("Another game active", show_alert=True)
+
+        players = prev.get("players", [])
+        if q.from_user.id not in players:
+            await q.answer("Players only", show_alert=True)
             return
+
+        group_id = prev["groupId"]
+        group = self.mongo.groups.find_one({"_id": group_id}) or {}
+        if group.get("activeGameId"):
+            await q.answer("Another game is active.", show_alert=True)
+            return
+
         new_id = str(uuid.uuid4())
-        now = dt.datetime.utcnow()
+        if not self.mongo.set_active_game_if_free(group_id, new_id):
+            await q.answer("Could not lock rematch", show_alert=True)
+            return
+
+        now = utcnow()
         new_game = {
             "_id": new_id,
             "groupId": group_id,
             "status": "SIGN_PICK",
             "createdAt": now,
             "updatedAt": now,
-            "createdBy": query.from_user.id,
+            "createdBy": q.from_user.id,
+            "hostId": players[0],
             "joinMode": "open",
             "invitedUser": None,
+            "invitedUsername": None,
             "joinExpiresAt": None,
             "playerX": None,
             "playerO": None,
-            "players": players,
+            "players": players[:2],
             "board": ["" for _ in range(9)],
             "turn": None,
             "moves": [],
@@ -617,33 +1049,36 @@ class TicToeBot:
             "result": None,
         }
         self.mongo.create_game(new_game)
-        if not self.mongo.set_active_game_if_free(group_id, new_id):
-            await query.answer("Could not lock rematch", show_alert=True)
-            return
-        await query.answer("Rematch! Pick signs")
-        await self.prompt_sign_choice(update, context, new_game)
+
+        await q.answer("Rematch! Pick signs ✅")
+        await self.render_lobby_or_sign(new_game, context)
 
     async def new_game_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data or not query.message or not query.message.chat:
-            return
-        await query.answer()
-        await context.bot.send_message(query.message.chat_id, "Use /startgame to begin a new lobby.")
+        q = update.callback_query
+        if q:
+            await q.answer()
+            await context.bot.send_message(q.message.chat_id, "Use /startgame to begin a new lobby.")
 
     async def fallback_join_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
+        q = update.callback_query
+        if not q or not q.message:
             return
-        fake_update = Update(update.update_id, message=query.message)
+        # Reuse join() logic by building a synthetic Update with message
+        fake_update = Update(update.update_id, message=q.message)
         await self.join(fake_update, context)
+
+    # --------------------- Build app ---------------------
 
     def build_app(self) -> Application:
         app = (
             Application.builder()
             .token(self.settings.bot_token)
             .rate_limiter(AIORateLimiter())
+            .post_init(self.post_init)
             .build()
         )
+
+        # Commands
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("startgame", self.startgame))
         app.add_handler(CommandHandler("join", self.join))
@@ -652,14 +1087,20 @@ class TicToeBot:
         app.add_handler(CommandHandler("broadcast", self.broadcast))
         app.add_handler(CommandHandler("forceend", self.forceend))
         app.add_handler(CommandHandler("setloggroup", self.setloggroup))
+
+        # Callbacks
         app.add_handler(CallbackQueryHandler(self.handle_sign, pattern=r"^ttt:sign:"))
         app.add_handler(CallbackQueryHandler(self.handle_cell, pattern=r"^ttt:cell:"))
+        app.add_handler(CallbackQueryHandler(self.filled_cell, pattern=r"^ttt:filled:"))
         app.add_handler(CallbackQueryHandler(self.accept_invite, pattern=r"^ttt:accept:"))
         app.add_handler(CallbackQueryHandler(self.decline_invite, pattern=r"^ttt:decline:"))
         app.add_handler(CallbackQueryHandler(self.flee, pattern=r"^ttt:flee:"))
+        app.add_handler(CallbackQueryHandler(self.cancel, pattern=r"^ttt:cancel:"))
         app.add_handler(CallbackQueryHandler(self.rematch, pattern=r"^ttt:rematch:"))
         app.add_handler(CallbackQueryHandler(self.new_game_button, pattern=r"^ttt:new:"))
         app.add_handler(CallbackQueryHandler(self.fallback_join_button, pattern=r"^ttt:join:"))
+        app.add_handler(CallbackQueryHandler(self.noop, pattern=r"^ttt:noop:"))
+
         return app
 
 
