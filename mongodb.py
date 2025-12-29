@@ -6,6 +6,7 @@ import datetime as dt
 from typing import Any, Dict, List, Optional
 
 from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import ConfigurationError
 from pymongo.collection import Collection
 
 from config import Settings
@@ -20,11 +21,12 @@ class Mongo:
 
     def __init__(self, settings: Settings) -> None:
         self.client = MongoClient(settings.mongo_url, appname="TictoeBot")
-        self.db = (
-            self.client.get_default_database()
-            if self.client.get_default_database()
-            else self.client["tictactoe"]
-        )
+        try:
+            default_db = self.client.get_default_database()
+        except ConfigurationError:
+            default_db = None
+
+        self.db = default_db or self.client["tictactoe"]
         self.groups: Collection = self.db["groups"]
         self.users: Collection = self.db["users"]
         self.games: Collection = self.db["games"]
