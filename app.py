@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+import html
 import random
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -68,7 +69,7 @@ def check_winner(board: List[str]) -> Tuple[Optional[str], Optional[List[int]]]:
 
 def mention_html(user_id: int, name: str) -> str:
     # Avoid importing helpers; keep it simple
-    return f'<a href="tg://user?id={user_id}">{name}</a>'
+    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
 
 
 # ------------------------- Bot ---------------------------------------------
@@ -188,7 +189,7 @@ class TicToeBot:
 
         group = self.mongo.groups.find_one({"_id": group_id})
         log_chat_id = group.get("logChatId") if group else None
-        if log_chat_id:
+        if log_chat_id and context is not None:
             try:
                 await context.bot.send_message(log_chat_id, f"[{type_}] {payload}")
             except Exception as exc:  # noqa: BLE001
@@ -263,7 +264,7 @@ class TicToeBot:
     async def post_shutdown(self, app: Application) -> None:
         if self._expiry_task:
             self._expiry_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._expiry_task
 
     # --------------------- Commands ---------------------
@@ -1133,6 +1134,7 @@ class TicToeBot:
             .token(self.settings.bot_token)
             .rate_limiter(AIORateLimiter())
             .post_init(self.post_init)
+            .post_shutdown(self.post_shutdown)
             .build()
         )
 
