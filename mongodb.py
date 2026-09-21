@@ -26,7 +26,7 @@ class Mongo:
         except ConfigurationError:
             default_db = None
 
-        self.db = default_db or self.client["tictactoe"]
+        self.db = default_db if default_db is not None else self.client["tictactoe"]
         self.groups: Collection = self.db["groups"]
         self.users: Collection = self.db["users"]
         self.games: Collection = self.db["games"]
